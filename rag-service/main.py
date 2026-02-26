@@ -144,8 +144,8 @@ def readiness_check():
 
 
 # ===============================
-# UPLOAD (NO AUTH, RETURNS session_id)
-# ===============================
+# UPLOAD (requires JWT auth, returns session_id bound to uploader)
+# =================
 @app.post("/upload")
 @limiter.limit("10/15 minutes")
 async def upload_file(
@@ -210,11 +210,18 @@ def ask_question(
     for sid in data.session_ids:
         session = sessions.get(sid)
         if session:
-            # FIX: enforce ownership — only allow access to own sessions
-            if session["user_id"] != current_user.id and current_user.role != UserRole.ADMIN:
+            # FIX: enforce ownership — use .get() to safely handle legacy sessions without user_id
+            owner_id = session.get("user_id")
+            if owner_id is not None and owner_id != current_user.id and current_user.role != UserRole.ADMIN:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Access denied: session '{sid}' belongs to another user."
+                )
+            # Sessions without user_id are restricted to admins only (legacy / pre-fix sessions)
+            if owner_id is None and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' is not associated with a user."
                 )
             session["last_accessed"] = time.time()
             vectorstores.extend(session["vectorstores"])
@@ -260,11 +267,17 @@ def summarize_pdf(
     for sid in data.session_ids:
         session = sessions.get(sid)
         if session:
-            # FIX: enforce ownership
-            if session["user_id"] != current_user.id and current_user.role != UserRole.ADMIN:
+            # FIX: enforce ownership — use .get() to safely handle legacy sessions without user_id
+            owner_id = session.get("user_id")
+            if owner_id is not None and owner_id != current_user.id and current_user.role != UserRole.ADMIN:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Access denied: session '{sid}' belongs to another user."
+                )
+            if owner_id is None and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' is not associated with a user."
                 )
             vectorstores.extend(session["vectorstores"])
 
@@ -302,11 +315,17 @@ def compare_documents(
     for sid in data.session_ids:
         session = sessions.get(sid)
         if session:
-            # FIX: enforce ownership
-            if session["user_id"] != current_user.id and current_user.role != UserRole.ADMIN:
+            # FIX: enforce ownership — use .get() to safely handle legacy sessions without user_id
+            owner_id = session.get("user_id")
+            if owner_id is not None and owner_id != current_user.id and current_user.role != UserRole.ADMIN:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail=f"Access denied: session '{sid}' belongs to another user."
+                )
+            if owner_id is None and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' is not associated with a user."
                 )
             vs = session["vectorstores"][0]
             chunks = vs.similarity_search("main topics", k=4)
