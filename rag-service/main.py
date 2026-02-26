@@ -1,0 +1,356 @@
+from fastapi import FastAPI, Request, File, UploadFile, Depends, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+from dotenv import load_dotenv
+from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from uuid import uuid4
+import os
+import time
+import uuid
+import torch
+import uvicorn
+
+# Authentication — required to prevent cross-user data leakage
+from auth.middleware import AuthMiddleware
+from auth.models import User, UserRole
+from auth.router import router as auth_router
+
+load_dotenv()
+
+app = FastAPI(
+    title="PDF QA Bot API",
+    description="PDF Question-Answering Bot with session-ownership enforcement",
+    version="2.2.0"
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Auth routes
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
+
+# ===============================
+# SESSION STORAGE
+# ===============================
+# Format: { session_id: { "vectorstores": [FAISS], "last_accessed": float, "user_id": int } }
+# user_id is set on upload and checked on every read — prevents cross-user leakage.
+sessions = {}
+SESSION_TIMEOUT = 3600  # 1 hour
+
+# Embedding model (loaded once)
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+# ===============================
+# LOAD GENERATION MODEL ONCE
+# ===============================
+HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
+
+config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
+is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
+tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
+
+if is_encoder_decoder:
+    model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
+else:
+    model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
+
+if torch.cuda.is_available():
+    model = model.to("cuda")
+
+model.eval()
+
+# ===============================
+# REQUEST MODELS
+# ===============================
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    session_ids: list = []
+
+
+class SummarizeRequest(BaseModel):
+    session_ids: list = []
+
+
+class CompareRequest(BaseModel):
+    session_ids: list = []
+
+
+# ===============================
+# UTILITIES
+# ===============================
+def cleanup_expired_sessions():
+    current_time = time.time()
+    expired = [
+        sid for sid, data in sessions.items()
+        if current_time - data["last_accessed"] > SESSION_TIMEOUT
+    ]
+    for sid in expired:
+        del sessions[sid]
+
+
+def generate_response(prompt: str, max_new_tokens: int = 200) -> str:
+    device = next(model.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    output = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    )
+
+    if is_encoder_decoder:
+        return tokenizer.decode(output[0], skip_special_tokens=True)
+
+    return tokenizer.decode(
+        output[0][inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )
+
+
+# ===============================
+# HEALTH ENDPOINTS (kept from enhancement branch)
+# ===============================
+@app.get("/healthz")
+def health_check():
+    return {"status": "healthy"}
+
+
+@app.get("/readyz")
+def readiness_check():
+    return {"status": "ready"}
+
+
+# ===============================
+# UPLOAD (requires JWT auth, returns session_id bound to uploader)
+# =================
+@app.post("/upload")
+@limiter.limit("10/15 minutes")
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: User = Depends(AuthMiddleware.get_current_user)
+):
+    if not file.filename.lower().endswith(".pdf"):
+        return {"error": "Only PDF files are supported"}
+
+    session_id = str(uuid4())
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+
+    try:
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
+
+        loader = PyPDFLoader(file_path)
+        docs = loader.load()
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100
+        )
+        chunks = splitter.split_documents(docs)
+
+        vectorstore = FAISS.from_documents(chunks, embedding_model)
+
+        sessions[session_id] = {
+            "vectorstores": [vectorstore],
+            "last_accessed": time.time(),
+            "user_id": current_user.id  # FIX: bind session to uploader
+        }
+
+        return {
+            "message": "PDF uploaded and processed",
+            "session_id": session_id
+        }
+
+    except Exception as e:
+        return {"error": f"Upload failed: {str(e)}"}
+
+
+# ===============================
+# ASK (USES session_ids — matches fixed App.js)
+# ===============================
+@app.post("/ask")
+@limiter.limit("60/15 minutes")
+def ask_question(
+    request: Request,
+    data: AskRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_user)
+):
+    cleanup_expired_sessions()
+
+    if not data.session_ids:
+        return {"answer": "No session selected."}
+
+    vectorstores = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            # FIX: enforce ownership — use .get() to safely handle legacy sessions without user_id
+            owner_id = session.get("user_id")
+            if owner_id is not None and owner_id != current_user.id and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' belongs to another user."
+                )
+            # Sessions without user_id are restricted to admins only (legacy / pre-fix sessions)
+            if owner_id is None and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' is not associated with a user."
+                )
+            session["last_accessed"] = time.time()
+            vectorstores.extend(session["vectorstores"])
+
+    if not vectorstores:
+        return {"answer": "No documents found for selected sessions."}
+
+    docs = []
+    for vs in vectorstores:
+        docs.extend(vs.similarity_search(data.question, k=4))
+
+    if not docs:
+        return {"answer": "No relevant context found."}
+
+    context = "\n\n".join([d.page_content for d in docs])
+
+    prompt = (
+        "Answer the question using ONLY the provided context.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {data.question}\nAnswer:"
+    )
+
+    answer = generate_response(prompt, 200)
+    return {"answer": answer}
+
+
+# ===============================
+# SUMMARIZE
+# ===============================
+@app.post("/summarize")
+@limiter.limit("15/15 minutes")
+def summarize_pdf(
+    request: Request,
+    data: SummarizeRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_user)
+):
+    cleanup_expired_sessions()
+
+    if not data.session_ids:
+        return {"summary": "No session selected."}
+
+    vectorstores = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            # FIX: enforce ownership — use .get() to safely handle legacy sessions without user_id
+            owner_id = session.get("user_id")
+            if owner_id is not None and owner_id != current_user.id and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' belongs to another user."
+                )
+            if owner_id is None and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' is not associated with a user."
+                )
+            vectorstores.extend(session["vectorstores"])
+
+    if not vectorstores:
+        return {"summary": "No documents found."}
+
+    docs = []
+    for vs in vectorstores:
+        docs.extend(vs.similarity_search("Summarize the document", k=6))
+
+    context = "\n\n".join([d.page_content for d in docs])
+
+    prompt = f"Summarize this document:\n\n{context}\n\nSummary:"
+    summary = generate_response(prompt, 250)
+
+    return {"summary": summary}
+
+
+# ===============================
+# COMPARE
+# ===============================
+@app.post("/compare")
+@limiter.limit("10/15 minutes")
+def compare_documents(
+    request: Request,
+    data: CompareRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_user)
+):
+    cleanup_expired_sessions()
+
+    if len(data.session_ids) < 2:
+        return {"comparison": "Select at least 2 documents."}
+
+    contexts = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            # FIX: enforce ownership — use .get() to safely handle legacy sessions without user_id
+            owner_id = session.get("user_id")
+            if owner_id is not None and owner_id != current_user.id and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' belongs to another user."
+                )
+            if owner_id is None and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' is not associated with a user."
+                )
+            vs = session["vectorstores"][0]
+            chunks = vs.similarity_search("main topics", k=4)
+            text = "\n".join([c.page_content for c in chunks])
+            contexts.append(text)
+
+    if len(contexts) < 2:
+        return {"comparison": "Not enough documents to compare."}
+
+    combined = "\n\n---\n\n".join(contexts)
+
+    prompt = (
+        "Compare the documents below.\n"
+        "Give similarities and differences.\n\n"
+        f"{combined}\n\nComparison:"
+    )
+
+    comparison = generate_response(prompt, 300)
+    return {"comparison": comparison}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=5000)
